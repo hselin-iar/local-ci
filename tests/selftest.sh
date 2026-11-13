@@ -32,7 +32,7 @@ cache /home/node/.npm
 install npm ci
 service postgres postgres:17
   env POSTGRES_PASSWORD=toy
-  health pg_isready -U postgres
+  health pg_isready -h 127.0.0.1 -U postgres
 job unit
   step unit: npm test && touch leftover-from-job-unit
     tests node

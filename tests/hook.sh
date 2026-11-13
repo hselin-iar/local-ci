@@ -27,7 +27,7 @@ out() { if [ -n "\$q" ]; then jq -r "\$q"; else cat; fi; }
 case "\$1 \$2" in
   "pr view") [ "\$3" = 777 ] || { echo "no pull requests found" >&2; exit 1; }
      jq -n --arg t "\${STUB_TITLE:-$TITLE}" '{number:777,title:\$t,headRefOid:"$SHA",headRefName:"feature/x",baseRefName:"main",author:{login:"octocat"}}' | out;;
-  "pr checks") exit "\${STUB_CHECKS:-1}";;
+  "pr checks") echo "\${STUB_CHECKS:-[{\"name\":\"test\",\"bucket\":\"fail\"}]}" | out;;
   "api user") echo '{"login":"octocat"}' | out;;
   "api "*"/statuses") echo "\${STUB_STATUSES:-[]}" | out;;
   "api "*"git/ref"*) echo "{\"object\":{\"sha\":\"\${STUB_TIP:-$TIP}\"}}" | out;;
@@ -56,6 +56,11 @@ expect "inside bash -c"                         deny "no run is recorded" "bash 
 expect "on a later line"                        deny "no run is recorded" "sleep 5
 $M 777 $OK"
 expect "through the API"                        deny "gh pr merge" "gh api -X PUT repos/o/r/pulls/777/merge"
+expect "gh called by its path"                  deny "no run is recorded" "/opt/homebrew/bin/$M 777 $OK"
+expect "behind timeout"                         deny "no run is recorded" "timeout 60 $M 777 $OK"
+expect "behind nohup, in the background"        deny "no run is recorded" "nohup $M 777 $OK &"
+expect "fed by xargs"                           deny "number first" "echo 777 | xargs $M"
+expect "a sentence that says it, outside backticks, is refused too (the safe side)" deny "number first" "echo we may $M later"
 
 echo "which pull request"
 evidence
@@ -69,7 +74,11 @@ expect "an unknown pull request"                deny "could not look up" "$M 999
 
 echo "the evidence on this machine"
 evidence;                                             expect "a good run"                    allow "" "$M 777 $OK"
-STUB_CHECKS=0 expect "green GitHub checks need no run" allow "" "$M 777 $OK"
+rm -f "$R/.git/local-ci/$SHA.md"
+STUB_CHECKS='[{"name":"test","bucket":"pass"},{"name":"lint","bucket":"pass"}]' expect "green GitHub checks need no run" allow "" "$M 777 $OK"
+STUB_CHECKS='[{"name":"test","bucket":"pass"},{"name":"lint","bucket":"pending"}]' expect "a pending GitHub check is not green" deny "no run is recorded" "$M 777 $OK"
+STUB_CHECKS='[{"name":"local-ci","bucket":"pass"}]' expect "a posted local-ci status made a required check is not GitHub's own checks" deny "no run is recorded" "$M 777 $OK"
+STUB_CHECKS='[]' expect "no required checks at all is not green" deny "no run is recorded" "$M 777 $OK"
 evidence 's/\| semgrep \| PASS/| semgrep | FAIL/';     expect "a check that did not pass"     deny "did not pass: semgrep" "$M 777 $OK"
 evidence 's/\| unit \| PASS/| unit | SKIP/';           expect "a check that was skipped"      deny "did not pass: unit" "$M 777 $OK"
 evidence "s/^- config: .*/- config: \/tmp\/x, NOT the commit's own (--config)/"; expect "a trial config" deny "trial config" "$M 777 $OK"

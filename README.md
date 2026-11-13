@@ -42,7 +42,7 @@ One instruction per line. It is read as data and never executed on your machine:
 | `keep <path>` | A path in the repository kept between jobs (installed packages). Without it the install runs again for every job. |
 | `install <command>` | Runs before the first step. |
 | `env NAME=value` | For every step; under a `job`, for that job; under a `service`, for that service. |
-| `service <name> <image>` with `health <command>` | A container the steps reach on `127.0.0.1`. Every job that `uses` it gets a fresh one. |
+| `service <name> <image>` with `health <command>` | A container the steps reach on `127.0.0.1`. Every job that `uses` it gets a fresh one. Make the health command connect the way the steps do: `pg_isready -h 127.0.0.1 ...`, since Postgres's image answers on its unix socket during set-up and then restarts. |
 | `job <name>` with `uses <service> ...` | A group of steps on its own fresh checkout, like a CI job. |
 | `step <name>: <command>` | A check. |
 | `tests node\|tap\|jest\|vitest\|pytest\|go` | Under a step: it must run at least one test; the count is recorded. |
@@ -69,7 +69,7 @@ Every step also gets `LOCAL_CI_SHA`, `LOCAL_CI_BASE`, `LOCAL_CI_MERGE_BASE`, and
 ## What it does that hosted CI usually does not
 
 - **No empty pass.** A test step passes only if its log shows tests ran; a scanner only if it shows commits scanned, rules applied, packages read.
-- **Test counts.** Each suite's count is recorded by tree. When the base branch's count is known and a suite now runs fewer tests, the summary says so in capitals.
+- **Test counts.** Each suite's count (for Node's runner, the tests that ran, skipped ones left out) is recorded by tree. When the base branch's count is known and a suite now runs fewer tests, the summary says so in capitals.
 - **Drift.** `mirrors` fails the run when the workflow file changes and the config has not followed.
 - **x64 on an arm64 machine.** Your install and build repeated on the CPU hosted CI and most servers use.
 - **Recipes.** `recipes/drizzle-migrations.sh` checks migrations against a database that already has the base branch's schema: no applied migration edited, none stamped out of order (Drizzle silently skips such a migration on an existing database), every one applied, and nothing left for the generator to write.
@@ -102,6 +102,7 @@ A pull request that edits `.local-ci/config` is judged by its own edits, so its 
 
 ## Limits, plainly
 
+- **Evidence can be written by hand.** It is a file in `.git` and a status on GitHub. The hook stops a merge whose run was skipped, forgotten or stale; it cannot stop a session, or a person, set on deceiving it.
 - **It is evidence, not a gate.** GitHub's branch protection knows only GitHub's own checks, unless you make `local-ci` a required status. Anyone who can push can post that status, which is why the hook looks at who posted it. Nothing here stops a merge made on GitHub's page.
 - **The config travels with the code**, as a workflow file does: a pull request can change its own checks. The merge hook does not accept such a run as proof (see above), but a run by hand still passes, so review changes to `.local-ci/config` as you would changes to a workflow.
 - **Containers are not a strong sandbox.** A step is code from the repository running in Docker on your machine. Run only code you would run anyway.
@@ -111,4 +112,4 @@ A pull request that edits `.local-ci/config` is judged by its own edits, so its 
 
 ## Checking the tool itself
 
-`tests/hook.sh` runs the merge hook through 40 cases against a stand-in `gh`: what counts as a merge, which pull request is checked, what evidence is accepted, whose shared result counts. `tests/selftest.sh` builds a toy project and proves that a clean commit passes and that each kind of defect fails: a failing test, a test step that runs nothing, a committed token, a pull request behind its base, a conflict, a config that tries to pass options to Docker. Run both after changing `local-ci` or the hook.
+`tests/hook.sh` runs the merge hook through 48 cases against a stand-in `gh`: what counts as a merge, which pull request is checked, what evidence is accepted, whose shared result counts. `tests/selftest.sh` builds a toy project and proves that a clean commit passes and that each kind of defect fails: a failing test, a test step that runs nothing, a committed token, a pull request behind its base, a conflict, a config that tries to pass options to Docker. Run both after changing `local-ci` or the hook.

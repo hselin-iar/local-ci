@@ -110,12 +110,13 @@ if [ -n "$WATCH" ]; then
     st="$(cd "$SRC" && gh api "repos/{owner}/{repo}/commits/$head/statuses" -q '[.[] | select(.context=="local-ci")][0].description // ""' 2>/dev/null)" || return 0
     case " $st " in *" $(status_key "$tip" "$title" "$1") "*) return 0;; esac; return 1   # each part matched whole: pr=10 is not pr=101
   }
+  PASSON=(); [ -n "$PLATFORM" ] && PASSON+=(--platform "$PLATFORM"); [ "$FULL" = 1 ] && PASSON+=(--full-secrets); [ "$FETCH" = 0 ] && PASSON+=(--no-fetch)
   echo "Watching open pull requests as ${RUNNER:-?}, every ${WATCH}s. Each new head commit gets a full run and a local-ci status. Ctrl-C stops."
   while :; do
     for n in $(cd "$SRC" && gh pr list --state open --limit 100 --json number,isDraft,isCrossRepository -q '.[] | select(.isDraft | not) | select(.isCrossRepository | not) | .number' 2>/dev/null); do
       has_result "$n" && continue
       echo; echo "=== pull request #$n, $(date '+%Y-%m-%d %H:%M') ==="
-      "$TOOL/local-ci" --pr "$n" --post
+      "$TOOL/local-ci" --pr "$n" --post "${PASSON[@]}"
     done
     sleep "$WATCH"
   done
@@ -212,6 +213,7 @@ if [ -n "$TITLE" ]; then MODE="pull-request"; else MODE="push"; fi
 [ "$MODE" = pull-request ] && [ -z "$AUTHOR" ] && AUTHOR="$RUNNER"
 if [ "$REF" = HEAD ] && [ -n "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]; then echo "note: uncommitted changes are NOT tested; only commit ${SHA:0:10} is."; fi
 HOSTARCH="$(docker info --format '{{.Architecture}}' 2>/dev/null)"; NATIVE_X64=0
+case "$HOSTARCH" in x86_64|amd64) NATIVE="linux/amd64";; aarch64|arm64) NATIVE="linux/arm64";; *) NATIVE="linux/$HOSTARCH";; esac
 case "$PLATFORM" in linux/amd64) NATIVE_X64=1;; "") case "$HOSTARCH" in x86_64|amd64) NATIVE_X64=1;; esac;; esac
 
 # ---------------------------------------------------------------- what runs
@@ -239,7 +241,7 @@ OUT="/tmp/local-ci/$NAME/${SHA:0:10}"; LOGS="$OUT/logs"; RES="$OUT/res"; mkdir -
 mkdir "$OUT.lock" 2>/dev/null || die "a run for ${SHA:0:10} is already going on this machine (if it died, remove $OUT.lock)"
 rm -rf "$OUT"; mkdir -p "$LOGS" "$RES"
 PRISTINE="$(mktemp -d /tmp/local-ci-src.XXXXXX)"; ID="lci-$$"; VOL="$ID-work"; VOL64="$ID-work64"
-PLAT=(); [ -n "$PLATFORM" ] && PLAT=(--platform "$PLATFORM")
+PLAT=(--platform "${PLATFORM:-$NATIVE}")   # always named: on Docker's classic image store, pulling the x64 image would otherwise re-point the tag for the steps after it
 cleanup() {
   local c; c="$(docker ps -aq --filter "name=^$ID-svc-" 2>/dev/null)"; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1
   docker volume rm -f "$VOL" "$VOL64" >/dev/null 2>&1; rm -rf "$PRISTINE" 2>/dev/null; rmdir "$OUT.lock" 2>/dev/null
@@ -252,8 +254,10 @@ record() { echo "$2 $3 $4" > "$RES/$1"; }   # name, status, seconds, detail
 #   PRISTINE  a clone on this disk that nothing writes to; the scanners read it (mounted read-only), so they never see installed packages or a build.
 #   VOL       a Docker volume holding a copy of it, where the install and the steps run. VOL64 is the same for the x64 check.
 git clone -q --no-checkout "$SRC" "$PRISTINE" || die "could not copy the repository"
-git -C "$PRISTINE" fetch -q "$SRC" "+refs/remotes/origin/*:refs/remotes/origin/*" "+refs/tags/*:refs/tags/*" "+refs/local-ci/*:refs/local-ci/*" 2>/dev/null
+git -C "$PRISTINE" fetch -q "$SRC" "+refs/remotes/origin/*:refs/remotes/origin/*" "+refs/tags/*:refs/tags/*" "+refs/local-ci/*:refs/local-ci/*" || die "could not copy the branches and tags"
 git -C "$PRISTINE" checkout -q --detach "$SHA" || die "could not check out $SHA"
+# A step that looks for origin/<base branch> finds the very commit this run measures against and records, whatever --base was given as (a local branch, a commit).
+git -C "$PRISTINE" update-ref "refs/remotes/origin/$BASE_NAME" "$BASE_SHA" 2>/dev/null
 
 echo "local-ci $VERSION: $NAME ${SHA:0:10} (tree ${TREE:0:10}), $MODE${PR:+ #$PR}${BRANCH:+, branch $BRANCH}, base $BASE_NAME ${BASE_SHA:0:10} ($AHEAD ahead, contains it: $UPTODATE)"
 # A pull request is tested as CI tests it: its head merged into the base branch as it is now. A branch that already contains the base is that merge.
@@ -266,7 +270,7 @@ if [ "$MODE" = pull-request ]; then
   else git -C "$PRISTINE" merge --abort >/dev/null 2>&1; MERGE_OK=0; record merge FAIL 0 "conflicts with $BASE_NAME ${BASE_SHA:0:10}"; echo "FAIL  conflicts with $BASE_NAME ${BASE_SHA:0:10}; nothing else can be tested"; fi
 fi
 
-pull() { docker pull -q --platform "${2:-${PLATFORM:-linux/$HOSTARCH}}" "$1" >/dev/null 2>&1 || echo "note: could not refresh $1; using the copy already here."; }
+pull() { docker pull -q --platform "${2:-${PLATFORM:-$NATIVE}}" "$1" >/dev/null 2>&1 || echo "note: could not refresh $1; using the copy already here."; }
 GITENV=(-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
 AS_USER=(); OWNER=""   # OWNER: the uid:gid the steps run as, for handing the working copy to that user
 [ -n "$RUN_USER" ] && AS_USER=(--user "$RUN_USER"); [ -n "$RUN_HOME" ] && AS_USER+=(-e "HOME=$RUN_HOME")
@@ -320,6 +324,8 @@ evidence() {   # check name, step index (or empty)
   if [ -n "$rx" ]; then
     if [ "$rx" = "@go" ]; then n="$(grep -acE '^ok[[:space:]]' "$log")"; else n="$(grep -aoE -- "$rx" "$log" | last_numbers)"; fi
     [ "${n:-0}" -gt 0 ] || { echo "no tests ran"; return 1; }; detail="$n tests"
+    # node's reporter counts a skipped test in its total; say how many, so the comparison with the base can leave them out
+    if [ "$rx" = '^[^ ]+ tests [0-9]+$' ]; then m="$(grep -aE '^[^ ]+ skipped [0-9]+$' "$log" | last_numbers)"; [ "${m:-0}" -gt 0 ] && detail="$n tests, $m skipped"; fi
   fi
   rx="${STEP_EXPECT[$2]}"
   if [ -n "$rx" ]; then m="$(grep -aoE -- "$rx" "$log" | tail -1 | cut -c1-70)"; [ -n "$m" ] || { echo "the log does not show what the config expects"; return 1; }; detail="${detail:+$detail, }$m"; fi
@@ -450,11 +456,12 @@ done
 COUNTS="$EVID/trees/$TREE"; BASECOUNTS="$EVID/trees/$BASE_TREE"; DROPS=""; COMPARED=0; i=0
 while [ $i -lt ${#STEP_NAME[@]} ]; do
   s="${STEP_NAME[$i]}"; i=$((i + 1)); [ -n "${STEP_COUNT[$((i - 1))]}" ] && [ -f "$RES/$s" ] || continue
-  read -r st _ note < "$RES/$s"; [ "$st" = PASS ] || continue; now="${note%% *}"
+  read -r st _ note < "$RES/$s"; [ "$st" = PASS ] || continue
+  now="${note%% *}"; sk="$(printf '%s' "$note" | sed -n 's/.* \([0-9][0-9]*\) skipped.*/\1/p')"; now=$((now - ${sk:-0}))   # tests that ran
   { grep -v "^$s " "$COUNTS" 2>/dev/null; echo "$s $now"; } > "$COUNTS.tmp" && mv "$COUNTS.tmp" "$COUNTS"
   [ "$TREE" != "$BASE_TREE" ] && [ -f "$BASECOUNTS" ] || continue
   was="$(sed -n "s/^$s //p" "$BASECOUNTS" | head -1)"; [ -n "$was" ] || continue; COMPARED=1
-  [ "$now" -lt "$was" ] && DROPS="$DROPS $s $now (the base ran $was);"
+  [ "$now" -lt "$was" ] && DROPS="$DROPS $s ran $now (the base ran $was);"
 done
 if [ -n "$DROPS" ]; then TESTLINE="FEWER TESTS than the base ${BASE_SHA:0:10}:${DROPS%;}. Say why in the pull request."; echo; echo "note: $TESTLINE"
 elif [ "$COMPARED" = 1 ]; then TESTLINE="no suite runs fewer tests than the base ${BASE_SHA:0:10} did."

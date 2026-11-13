@@ -9,7 +9,9 @@
 # It is strict about the command so that what it checked is what gets merged: one merge per command, the pull request's number first, and
 # --match-head-commit <the commit it checked>. Merging through `gh api` is refused. If it cannot read the command or look the pull request up, it refuses.
 # Limits: it binds Claude Code sessions on machines that installed it; a person merging in their own terminal or on GitHub's page is not stopped. It reads the command
-# as text, so a command that only quotes the merge command at the start of a string is refused too, and a merge hidden in a variable or a script file is not seen.
+# as text, so a command that merely says the merge command outside backticks is refused too, and a merge hidden in a variable or a script file is not seen. The
+# evidence is a file in .git and a status on GitHub, both of which a session could write by hand: the hook stops a merge whose run was skipped, forgotten or stale,
+# not a session set on deceiving it.
 # Tests: tests/hook.sh. Input: the hook JSON on stdin.
 set -uo pipefail
 
@@ -20,16 +22,16 @@ if ! command -v jq >/dev/null 2>&1 || ! cmd="$(printf '%s' "$in" | jq -er '.tool
   exit 0
 fi
 
-# A real invocation: where a command starts (a line start, after ; & | ( { or a quote, after then/do/else and the like), with any VAR=value prefixes and gh's -R/--repo.
-# Prose that mentions the command in the middle of a sentence or in backticks is not one.
-START="(^|[;&|({\"']|(^|[[:space:];&|(])(then|do|else|elif|time|sudo|command|env|exec|!)[[:space:]])"
-PREFIX="([[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)*[[:space:]]*gh([[:space:]]+(-R|--repo)[[:space:]=]+[^[:space:]]+)*[[:space:]]+"
+# A merge is `gh`, as a word (bare, by its path, after timeout, nohup, env, a VAR=value prefix, `then`, a pipe to xargs, anything), then pr merge, with gh's -R/--repo
+# allowed in between. Only a mention inside backticks is taken for prose. A sentence that says it without backticks is refused as well: that errs on the safe side,
+# and such text can be written with the file tools instead of the shell.
+GHWORD="(^|[^A-Za-z0-9_.\`-])gh([[:space:]]+(-R|--repo)[[:space:]=]+[^[:space:]]+)*[[:space:]]+"
 deny() {
   jq -n --arg r "$1" '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
   exit 0
 }
-if printf '%s' "$cmd" | grep -Eq "${START}${PREFIX}api[[:space:]][^;&|]*pulls/[0-9]+/merge"; then deny "Merge refused: merge with: gh pr merge <number> --match-head-commit <sha>, so the CI evidence can be checked. Merging through gh api is not allowed."; fi
-printf '%s' "$cmd" | grep -Eq "${START}${PREFIX}pr[[:space:]]+merge([[:space:]]|\$)" || exit 0
+if printf '%s' "$cmd" | grep -Eq "${GHWORD}api[[:space:]][^;&|]*pulls/[0-9]+/merge"; then deny "Merge refused: merge with: gh pr merge <number> --match-head-commit <sha>, so the CI evidence can be checked. Merging through gh api is not allowed."; fi
+printf '%s' "$cmd" | grep -Eq "${GHWORD}pr[[:space:]]+merge([[:space:]]|\$)" || exit 0
 
 # No evidence. With --admin the person is asked to approve by hand in the permission prompt (the reason is shown there); without it the merge is refused.
 # Only the person can answer that prompt, so this is the exception for the right reasons (Actions minutes exhausted, a pull request that changes its own checks).
@@ -52,8 +54,9 @@ title="$(jq -r .title <<<"$view")"; author="$(jq -r .author.login <<<"$view")"; 
 # The merge must be pinned to the commit this hook checks: a push between this check and the merge would otherwise merge a commit nothing has tested.
 case "$cmd" in *"--match-head-commit $sha"*|*"--match-head-commit=$sha"*) ;; *) deny "Merge refused: add --match-head-commit $sha to the command, so that exactly the commit that was checked is merged.";; esac
 
-# A. GitHub's own required checks.
-if gh pr checks "$num" --required >/dev/null 2>&1; then exit 0; fi
+# A. GitHub's own required checks: at least one, every one passed. A `local-ci` status does not count here even if it has been made a required check: anyone who can
+# push can post one, so it is judged below (C), where the hook looks at who posted it and what it was measured against.
+if [ "$(gh pr checks "$num" --required --json name,bucket -q '[.[] | select(.name != "local-ci")] | length > 0 and all(.bucket == "pass")' 2>/dev/null)" = true ]; then exit 0; fi
 
 # The base branch's present tip: a run against an older one did not test what the merge will produce.
 tip="$(gh api "repos/{owner}/{repo}/git/ref/heads/$base" -q .object.sha 2>/dev/null)" || tip=""
