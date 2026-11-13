@@ -61,6 +61,11 @@ expect "behind timeout"                         deny "no run is recorded" "timeo
 expect "behind nohup, in the background"        deny "no run is recorded" "nohup $M 777 $OK &"
 expect "fed by xargs"                           deny "number first" "echo 777 | xargs $M"
 expect "a sentence that says it, outside backticks, is refused too (the safe side)" deny "number first" "echo we may $M later"
+expect "inside backtick command substitution"   deny "no run is recorded" "x=\`$M 777 $OK\`"
+LONG="$(head -c 300000 /dev/zero | tr '\0' 'x')"   # longer than a pipe holds: the check must not give up half way and let it through
+expect "a very long command with a merge at the start" deny "no run is recorded" "$M 777 $OK --body $LONG"
+expect "a very long command with a merge at the end"   deny "no run is recorded" "echo $LONG; $M 777 $OK"
+expect "a very long command with no merge"             allow "" "echo $LONG"
 
 echo "which pull request"
 evidence

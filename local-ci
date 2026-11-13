@@ -107,16 +107,21 @@ if [ -n "$WATCH" ]; then
     meta="$(cd "$SRC" && gh pr view "$1" --json title,headRefOid,baseRefName -q '.title, .headRefOid, .baseRefName' 2>/dev/null)" || return 0   # cannot tell: do not run blind
     { read -r title; read -r head; read -r base; } <<<"$meta"
     tip="$(cd "$SRC" && gh api "repos/{owner}/{repo}/git/ref/heads/$base" -q .object.sha 2>/dev/null)" || return 0
+    THIS="$1:$head:$(status_key "$tip" "$title" "$1")"   # what a run now would be about
     st="$(cd "$SRC" && gh api "repos/{owner}/{repo}/commits/$head/statuses" -q '[.[] | select(.context=="local-ci")][0].description // ""' 2>/dev/null)" || return 0
     case " $st " in *" $(status_key "$tip" "$title" "$1") "*) return 0;; esac; return 1   # each part matched whole: pr=10 is not pr=101
   }
   PASSON=(); [ -n "$PLATFORM" ] && PASSON+=(--platform "$PLATFORM"); [ "$FULL" = 1 ] && PASSON+=(--full-secrets); [ "$FETCH" = 0 ] && PASSON+=(--no-fetch)
+  TRIED=" "; THIS=""
   echo "Watching open pull requests as ${RUNNER:-?}, every ${WATCH}s. Each new head commit gets a full run and a local-ci status. Ctrl-C stops."
   while :; do
     for n in $(cd "$SRC" && gh pr list --state open --limit 100 --json number,isDraft,isCrossRepository -q '.[] | select(.isDraft | not) | select(.isCrossRepository | not) | .number' 2>/dev/null); do
       has_result "$n" && continue
+      # Once per commit, base and title in this watch: a run that could not post its result (no network, no permission) would otherwise be repeated every cycle for ever.
+      case "$TRIED" in *" $THIS "*) continue;; esac; TRIED="$TRIED $THIS "
       echo; echo "=== pull request #$n, $(date '+%Y-%m-%d %H:%M') ==="
       "$TOOL/local-ci" --pr "$n" --post "${PASSON[@]}"
+      has_result "$n" || echo "note: no result was posted for #$n; it is not tried again until its commit, base or title changes (or this watch is restarted)."
     done
     sleep "$WATCH"
   done

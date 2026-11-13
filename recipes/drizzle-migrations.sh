@@ -72,7 +72,9 @@ if [ "$(cat /tmp/migration-base)" -gt 0 ]; then
   rm -rf "$DIR" && git checkout -q "$BASE" -- "$DIR"
   $MIGRATE
   applied "$(cat /tmp/migration-base)" "the base branch's migrations"
-  rm -rf "$DIR" && git checkout -q HEAD -- "$DIR"
+  # Back to this commit's folder, index included: checking the base's files out staged them, and a file this commit deleted would otherwise stay staged and be
+  # reported in step 3 as something the generator wrote.
+  rm -rf "$DIR" && git reset -q HEAD -- "$DIR" && git checkout -q HEAD -- "$DIR"
 fi
 $MIGRATE
 applied "$(cat /tmp/migration-head)" "this commit's migrations on top"

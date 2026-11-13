@@ -112,4 +112,4 @@ A pull request that edits `.local-ci/config` is judged by its own edits, so its 
 
 ## Checking the tool itself
 
-`tests/hook.sh` runs the merge hook through 48 cases against a stand-in `gh`: what counts as a merge, which pull request is checked, what evidence is accepted, whose shared result counts. `tests/selftest.sh` builds a toy project and proves that a clean commit passes and that each kind of defect fails: a failing test, a test step that runs nothing, a committed token, a pull request behind its base, a conflict, a config that tries to pass options to Docker. Run both after changing `local-ci` or the hook.
+`tests/hook.sh` runs the merge hook through 52 cases against a stand-in `gh`: what counts as a merge, which pull request is checked, what evidence is accepted, whose shared result counts. `tests/selftest.sh` builds a toy project and proves that a clean commit passes and that each kind of defect fails: a failing test, a test step that runs nothing, a committed token, a pull request behind its base, a conflict, a config that tries to pass options to Docker. Run both after changing `local-ci` or the hook.

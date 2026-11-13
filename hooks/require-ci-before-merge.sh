@@ -18,20 +18,23 @@ set -uo pipefail
 in="$(cat)"
 refuse_raw() { printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Merge refused: the merge hook could not read the command (it needs jq and the hook JSON). Nothing that looks like a merge is let through."}}'; }
 if ! command -v jq >/dev/null 2>&1 || ! cmd="$(printf '%s' "$in" | jq -er '.tool_input.command' 2>/dev/null)"; then
-  printf '%s' "$in" | grep -Eq 'gh[^;&|]*[[:space:]](pr[[:space:]]+merge|api[[:space:]][^;&|]*/merge)' && refuse_raw
+  grep -Eq 'gh[^;&|]*[[:space:]](pr[[:space:]]+merge|api[[:space:]][^;&|]*/merge)' <<<"$in" && refuse_raw
   exit 0
 fi
 
-# A merge is `gh`, as a word (bare, by its path, after timeout, nohup, env, a VAR=value prefix, `then`, a pipe to xargs, anything), then pr merge, with gh's -R/--repo
-# allowed in between. Only a mention inside backticks is taken for prose. A sentence that says it without backticks is refused as well: that errs on the safe side,
-# and such text can be written with the file tools instead of the shell.
-GHWORD="(^|[^A-Za-z0-9_.\`-])gh([[:space:]]+(-R|--repo)[[:space:]=]+[^[:space:]]+)*[[:space:]]+"
+# A merge is `gh`, as a word (bare, by its path, after timeout, nohup, env, a VAR=value prefix, `then`, a pipe to xargs, inside $( ) or backticks, anything), then
+# pr merge, with gh's -R/--repo allowed in between. The one thing taken for prose is the bare name of the command in backticks, with nothing after `merge`. A sentence that
+# says more than that is refused as well: that errs on the safe side, and such text can be written with the file tools instead of the shell.
+# The text is always handed to grep and sed as a here-string, never through a pipe: with pipefail, a writer cut short by `grep -q` on a long command would look like
+# "no match" and let the merge through.
+GHWORD="(^|[^A-Za-z0-9_.-])gh([[:space:]]+(-R|--repo)[[:space:]=]+[^[:space:]]+)*[[:space:]]+"
+scan="$(sed -E 's/`gh[[:space:]]+pr[[:space:]]+merge`//g' <<<"$cmd")"
 deny() {
   jq -n --arg r "$1" '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
   exit 0
 }
-if printf '%s' "$cmd" | grep -Eq "${GHWORD}api[[:space:]][^;&|]*pulls/[0-9]+/merge"; then deny "Merge refused: merge with: gh pr merge <number> --match-head-commit <sha>, so the CI evidence can be checked. Merging through gh api is not allowed."; fi
-printf '%s' "$cmd" | grep -Eq "${GHWORD}pr[[:space:]]+merge([[:space:]]|\$)" || exit 0
+if grep -Eq "${GHWORD}api[[:space:]][^;&|]*pulls/[0-9]+/merge" <<<"$scan"; then deny "Merge refused: merge with: gh pr merge <number> --match-head-commit <sha>, so the CI evidence can be checked. Merging through gh api is not allowed."; fi
+grep -Eq "${GHWORD}pr[[:space:]]+merge([[:space:]]|\`|\$)" <<<"$scan" || exit 0
 
 # No evidence. With --admin the person is asked to approve by hand in the permission prompt (the reason is shown there); without it the merge is refused.
 # Only the person can answer that prompt, so this is the exception for the right reasons (Actions minutes exhausted, a pull request that changes its own checks).
@@ -44,8 +47,8 @@ noproof() {
 
 # Exactly one merge, and its first word is the pull request's number. Anything else (a branch name, no number, options first, two merges) could make this hook
 # look at one pull request while the command merges another.
-[ "$(printf '%s' "$cmd" | grep -oE "pr[[:space:]]+merge([[:space:]]|\$)" | wc -l | tr -d ' ')" = 1 ] || deny "Merge refused: one merge per command, so that the pull request checked is the one merged."
-num="$(printf '%s' "$cmd" | sed -nE 's/.*pr[[:space:]]+merge[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)"
+[ "$(grep -oE "pr[[:space:]]+merge([[:space:]]|\`|\$)" <<<"$scan" | wc -l | tr -d ' ')" = 1 ] || deny "Merge refused: one merge per command, so that the pull request checked is the one merged."
+num="$(sed -nE 's/.*pr[[:space:]]+merge[[:space:]]+([^[:space:]]+).*/\1/p' <<<"$scan" | head -1)"
 case "$num" in ''|*[!0-9]*) deny "Merge refused: put the pull request's number first: gh pr merge <number> --squash --match-head-commit <sha>. A branch name, a URL or options before the number are not accepted.";; esac
 
 view="$(gh pr view "$num" --json number,title,headRefOid,headRefName,baseRefName,author 2>&1)" || deny "Merge refused: could not look up pull request #$num (${view:0:200})."
