@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+# local-ci: run a project's CI checks on your own machine, for one commit, on a CLEAN COPY of it, in Linux containers.
+# It costs no GitHub Actions minutes and is built to be as strict as a hosted run: the committed files only, a fresh base branch, a fresh checkout per job,
+# fresh service containers per job, an unprivileged user, pinned scanners, and no check that passes without doing its work.
+#
+#   local-ci --pr 101            a pull request as CI sees it: the merge of its head into its base; title, branch, base and author come from GitHub
+#   local-ci                     HEAD, as a push to the default branch is checked (no pull-request steps; secrets scanned over the whole history)
+#   local-ci --title "My PR"     HEAD as a pull request that is not open yet (branch: the current one; author: you; base: --base, default from the config)
+#   local-ci --only lint,unit    just those (never merge evidence); --skip build leaves some out
+#   local-ci --ref origin/dev    another commit; --branch names its pull-request branch when --title is given
+#   local-ci --watch             stay on and check every open pull request's new head commit, posting each result (a team's CI machine); --watch 120 sets the seconds
+#   local-ci init [node|python|go|generic]     write a starting .local-ci/config for this repository
+#   local-ci hook [--install]                  the Claude Code hook that refuses `gh pr merge` without a passing run
+#   other options: --base <ref>, --author <login>, --platform linux/amd64 (everything as x64), --full-secrets (whole history even for a pull request), --no-fetch,
+#                  --config <file> (a config that is not the commit's own: for trying one out, never merge evidence),
+#                  --post (after a full pass or a failure: a `local-ci` commit status on GitHub and, with --pr, the summary as a comment)
+#
+# The checks are the project's own, declared in .local-ci/config of the commit under test (see README.md). The config is read as data, never executed on this machine;
+# its commands run only inside containers.
+# Results: a table at the end, one log per check under /tmp/local-ci/<project>/<commit>/, and the summary, also kept in .git/local-ci/<commit>.md (the merge hook reads that).
+set -o pipefail
+VERSION="1.0.0"
+
+self="${BASH_SOURCE[0]}"; while [ -L "$self" ]; do d="$(cd "$(dirname "$self")" && pwd)"; self="$(readlink "$self")"; case "$self" in /*) ;; *) self="$d/$self";; esac; done
+TOOL="$(cd "$(dirname "$self")" && pwd)"
+die() { echo "local-ci: $*" >&2; exit 2; }
+usage() { sed -n '2,19p' "$TOOL/local-ci" | sed 's/^# \{0,1\}//'; }
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi | cut -d' ' -f1; }
+# What a posted result was measured against: the base branch's tip, the title and the pull request. The merge hook and --watch compare it with the present.
+status_key() { printf 'base=%s title=%s pr=%s' "${1:0:12}" "$(printf '%s' "$2" | sha256 | cut -c1-8)" "${3:--}"; }
+trim() { local s=$1; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+ok_name() { case "$1" in ''|-*|*[!A-Za-z0-9._-]*) return 1;; esac; return 0; }            # a check, job or service name
+ok_ref()  { case "$1" in ''|-*|*..*|*[!A-Za-z0-9._/:@=+-]*) return 1;; esac; return 0; }   # an image, a path, a scanner argument: never an option, never outside the repository
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) die "run this inside WSL 2 (with Docker Desktop's WSL integration), not Git Bash: Docker needs Linux paths.";; esac
+
+# ---------------------------------------------------------------- init, hook
+cmd_init() {
+  local src kind=${1:-} f
+  src="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+  [ -e "$src/.local-ci/config" ] && die "$src/.local-ci/config already exists"
+  if [ -z "$kind" ]; then
+    if [ -f "$src/package.json" ]; then kind=node; elif [ -f "$src/pyproject.toml" ] || [ -f "$src/requirements.txt" ]; then kind=python; elif [ -f "$src/go.mod" ]; then kind=go; else kind=generic; fi
+  fi
+  [ -f "$TOOL/templates/$kind" ] || die "no template called $kind (node, python, go, generic)"
+  mkdir -p "$src/.local-ci" && cp "$TOOL/templates/$kind" "$src/.local-ci/config"
+  echo "Wrote .local-ci/config from the $kind template. Edit it to name this project's real checks, commit it, then run: local-ci"
+  for f in "$src"/.github/workflows/*.yml "$src"/.github/workflows/*.yaml; do
+    [ -f "$f" ] || continue
+    echo; echo "Commands found in ${f#"$src"/} (make each one a step, and pin the file with: mirrors ${f#"$src"/} $(sha256 "$f")):"
+    grep -nE '^[[:space:]]*-?[[:space:]]*run:' "$f" | sed 's/^/  /' | cut -c1-160
+  done
+}
+cmd_hook() {
+  local src hook="$TOOL/hooks/require-ci-before-merge.sh" cmd f
+  cmd="in=\$(cat); s=\"$hook\"; if [ -x \"\$s\" ]; then printf '%s' \"\$in\" | \"\$s\"; elif printf '%s' \"\$in\" | grep -Eq '(^|[;&|(])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Merge refused: the local-ci merge hook is missing from this machine.\"}}'; fi"
+  if [ "${1:-}" != "--install" ]; then
+    echo "Add this to .claude/settings.local.json (or run: local-ci hook --install):"
+    jq -n --arg c "$cmd" '{hooks:{PreToolUse:[{matcher:"Bash",hooks:[{type:"command",command:$c,timeout:120,statusMessage:"Checking CI evidence before merge..."}]}]}}'
+    return 0
+  fi
+  command -v jq >/dev/null || die "the hook needs jq"
+  src="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+  f="$src/.claude/settings.local.json"; mkdir -p "$src/.claude"; [ -f "$f" ] || echo '{}' > "$f"
+  if jq -e --arg h "$hook" '[.hooks.PreToolUse[]?.hooks[]?.command // "" | contains($h)] | any' "$f" >/dev/null 2>&1; then echo "already installed in $f"; return 0; fi
+  jq --arg c "$cmd" '.hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{matcher:"Bash",hooks:[{type:"command",command:$c,timeout:120,statusMessage:"Checking CI evidence before merge..."}]}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  grep -qx '.claude/settings.local.json' "$src/.git/info/exclude" 2>/dev/null || echo '.claude/settings.local.json' >> "$src/.git/info/exclude"
+  echo "Installed in $f. Claude Code sessions in this repository now need a passing local-ci run (or green GitHub checks) before \`gh pr merge\`."
+}
+case "${1:-}" in
+  init) shift; cmd_init "$@"; exit $?;;
+  hook) shift; cmd_hook "$@"; exit $?;;
+  version|--version) echo "local-ci $VERSION"; exit 0;;
+  help|-h|--help) usage; exit 0;;
+esac
+
+# ---------------------------------------------------------------- options
+REF=""; BASE=""; TITLE=""; AUTHOR=""; BRANCH=""; PR=""; ONLY=""; SKIP=""; PLATFORM=""; FULL=0; FETCH=1; POST=0; WATCH=""; CONFIG=""
+val() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pr) val "$@"; PR=${2#\#}; shift 2;; --ref) val "$@"; REF=$2; shift 2;; --base) val "$@"; BASE=$2; shift 2;; --title) val "$@"; TITLE=$2; shift 2;;
+    --author) val "$@"; AUTHOR=$2; shift 2;; --branch) val "$@"; BRANCH=$2; shift 2;; --only) val "$@"; ONLY=$2; shift 2;; --skip) val "$@"; SKIP=$2; shift 2;;
+    --platform) val "$@"; PLATFORM=$2; shift 2;; --config) val "$@"; CONFIG=$2; shift 2;; --full-secrets) FULL=1; shift;; --no-fetch) FETCH=0; shift;; --post) POST=1; shift;;
+    --watch) WATCH=300; shift; case "${1:-}" in ''|*[!0-9]*) ;; *) WATCH=$1; shift;; esac;;
+    *) echo "unknown option: $1"; usage; exit 2;;
+  esac
+done
+in_list() { case ",$2," in *",$1,"*) return 0;; esac; return 1; }
+[ -n "$ONLY" ] && [ -n "$SKIP" ] && die "give --only or --skip, not both"
+[ -n "$PR" ] && [ -n "$REF$TITLE$AUTHOR$BRANCH$BASE" ] && die "--pr takes the commit, title, branch, base and author from GitHub; leave --ref, --title, --branch, --base and --author out"
+case "$PR" in *[!0-9]*) die "--pr needs a number";; esac
+
+SRC="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+command -v docker >/dev/null && docker info >/dev/null 2>&1 || die "Docker is not running. Start it and try again."
+GITDIR="$(git -C "$SRC" rev-parse --path-format=absolute --git-common-dir)"; EVID="$GITDIR/local-ci"; mkdir -p "$EVID/trees"
+RUNNER="$(cd "$SRC" && gh api user -q .login 2>/dev/null)"   # whose machine this is: written in the summary, and GitHub records it on a posted status
+
+# --watch: a machine left on as the team's CI. Every open pull request (not a draft, not from a fork) whose head commit has no result for its present base and title gets
+# a full run, posted. A result is not repeated until the commit, the base branch or the title changes.
+if [ -n "$WATCH" ]; then
+  [ -n "$PR$REF$TITLE$ONLY$SKIP$CONFIG" ] && die "--watch takes no --pr, --ref, --title, --only, --skip or --config: it runs every open pull request in full"
+  command -v gh >/dev/null || die "--watch needs the gh CLI"
+  LOCK="$EVID/watch.lock"; mkdir "$LOCK" 2>/dev/null || die "a watch is already running for this repository on this machine (if it died, remove $LOCK)"
+  trap 'rmdir "$LOCK" 2>/dev/null' EXIT; trap 'echo; exit 130' INT TERM HUP
+  has_result() {   # pull request number; 0 when its head commit already carries a local-ci status for the present base and title
+    local meta title head base tip st
+    meta="$(cd "$SRC" && gh pr view "$1" --json title,headRefOid,baseRefName -q '.title, .headRefOid, .baseRefName' 2>/dev/null)" || return 0   # cannot tell: do not run blind
+    { read -r title; read -r head; read -r base; } <<<"$meta"
+    tip="$(cd "$SRC" && gh api "repos/{owner}/{repo}/git/ref/heads/$base" -q .object.sha 2>/dev/null)" || return 0
+    st="$(cd "$SRC" && gh api "repos/{owner}/{repo}/commits/$head/statuses" -q '[.[] | select(.context=="local-ci")][0].description // ""' 2>/dev/null)" || return 0
+    case "$st" in *"$(status_key "$tip" "$title" "$1")"*) return 0;; esac; return 1
+  }
+  echo "Watching open pull requests as ${RUNNER:-?}, every ${WATCH}s. Each new head commit gets a full run and a local-ci status. Ctrl-C stops."
+  while :; do
+    for n in $(cd "$SRC" && gh pr list --state open --limit 100 --json number,isDraft,isCrossRepository -q '.[] | select(.isDraft | not) | select(.isCrossRepository | not) | .number' 2>/dev/null); do
+      has_result "$n" && continue
+      echo; echo "=== pull request #$n, $(date '+%Y-%m-%d %H:%M') ==="
+      "$TOOL/local-ci" --pr "$n" --post
+    done
+    sleep "$WATCH"
+  done
+fi
+
+# ---------------------------------------------------------------- the commit, its base, the pull request
+# The base branch as GitHub has it now. A stale copy would test the wrong merge and scan the wrong commits for secrets.
+HAS_ORIGIN=0; git -C "$SRC" remote get-url origin >/dev/null 2>&1 && HAS_ORIGIN=1
+if [ "$FETCH" = 1 ] && [ "$HAS_ORIGIN" = 1 ]; then
+  if git -C "$SRC" fetch -q --tags origin 2>/dev/null; then FETCHED="fetched from origin for this run"; else FETCHED="NOT refreshed (git fetch failed)"; echo "note: git fetch origin failed; the base branch may be stale."; fi
+elif [ "$HAS_ORIGIN" = 1 ]; then FETCHED="NOT refreshed (--no-fetch)"; else FETCHED="no remote called origin"; fi
+if [ -n "$PR" ]; then
+  META="$(cd "$SRC" && gh pr view "$PR" --json title,headRefName,headRefOid,baseRefName,author,state -q '.title, .headRefName, .headRefOid, .baseRefName, .author.login, .state' 2>&1)" || die "cannot read pull request #$PR: $META"
+  { read -r TITLE; read -r BRANCH; read -r PR_HEAD; read -r PR_BASE; read -r AUTHOR; read -r PR_STATE; } <<<"$META"
+  BASE="origin/$PR_BASE"
+  git -C "$SRC" fetch -q origin "+refs/pull/$PR/head:refs/local-ci/pr-$PR" || die "cannot fetch the head of pull request #$PR"
+  REF="refs/local-ci/pr-$PR"
+  [ "$(git -C "$SRC" rev-parse "$REF")" = "$PR_HEAD" ] || die "pull request #$PR moved while it was being fetched; run again"
+  [ "$PR_STATE" = OPEN ] || echo "note: pull request #$PR is $PR_STATE."
+fi
+[ -z "$REF" ] && REF=HEAD
+SHA="$(git -C "$SRC" rev-parse --verify "$REF^{commit}" 2>/dev/null)" || die "cannot find $REF"
+
+# ---------------------------------------------------------------- the config: read as data, from the commit under test
+NAME="$(basename "$SRC")"; IMAGE=""; RUN_USER=""; RUN_HOME=""; INSTALL=""; DEFAULT_BASE="main"; X64_CMD=""
+T_actionlint="rhysd/actionlint:1.7.7"; T_osv="ghcr.io/google/osv-scanner:v2.7.0"; T_gitleaks="ghcr.io/gitleaks/gitleaks:v8.30.1"; T_semgrep="semgrep/semgrep:1.182.0"
+CACHES=(); KEEPS=(); MIRROR_FILE=(); MIRROR_SHA=(); ENV_OWNER=(); ENV_KV=()
+SVC_NAME=(); SVC_IMAGE=(); SVC_HEALTH=(); JOB_NAME=(); JOB_USES=()
+STEP_NAME=(); STEP_JOB=(); STEP_CMD=(); STEP_COUNT=(); STEP_EXPECT=(); STEP_PR=(); SCAN_KIND=(); SCAN_ARGS=()
+load_config() {
+  local file=$1 line word rest owner="g" kind="" n=0 last a
+  bad() { die "$CONFIG_LABEL line $n: $1"; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1)); line="$(trim "$line")"; case "$line" in ''|'#'*) continue;; esac
+    word="${line%%[[:space:]]*}"; rest="$(trim "${line#"$word"}")"
+    case "$word" in
+      name)    ok_name "$rest" || bad "name takes letters, digits, dot, dash and underscore"; NAME=$rest;;
+      base)    ok_ref "$rest" || bad "base takes a branch name"; DEFAULT_BASE=$rest;;
+      image)   ok_ref "$rest" || bad "image takes an image reference"; IMAGE=$rest;;
+      user)    ok_name "$rest" || bad "user takes a user name"; RUN_USER=$rest;;
+      home)    ok_ref "$rest" || bad "home takes a path"; RUN_HOME=$rest;;
+      cache)   ok_ref "$rest" || bad "cache takes a path inside the container"; CACHES+=("$rest");;
+      keep)    ok_ref "$rest" || bad "keep takes a path in the repository"; KEEPS+=("$rest");;
+      install) [ -n "$rest" ] || bad "install takes a command"; INSTALL=$rest;;
+      x64)     [ -n "$rest" ] || bad "x64 takes a command"; X64_CMD=$rest;;
+      env)     case "$rest" in [A-Za-z_]*=*) ;; *) bad "env takes NAME=value";; esac; ok_name "${rest%%=*}" || bad "env takes NAME=value"; ENV_OWNER+=("$owner"); ENV_KV+=("$rest");;
+      mirrors) a="${rest%%[[:space:]]*}"; rest="$(trim "${rest#"$a"}")"; ok_ref "$a" || bad "mirrors takes a file and its sha256"
+               case "$rest" in *[!0-9a-f]*|'') bad "mirrors takes a file and its sha256";; esac; MIRROR_FILE+=("$a"); MIRROR_SHA+=("$rest");;
+      tool)    a="${rest%%[[:space:]]*}"; rest="$(trim "${rest#"$a"}")"; ok_ref "$rest" || bad "tool takes a scanner and an image"
+               case "$a" in actionlint) T_actionlint=$rest;; osv) T_osv=$rest;; gitleaks) T_gitleaks=$rest;; semgrep) T_semgrep=$rest;; *) bad "tool: actionlint, osv, gitleaks or semgrep";; esac;;
+      service) a="${rest%%[[:space:]]*}"; rest="$(trim "${rest#"$a"}")"; ok_name "$a" || bad "service takes a name and an image"; ok_ref "$rest" || bad "service takes a name and an image"
+               SVC_NAME+=("$a"); SVC_IMAGE+=("$rest"); SVC_HEALTH+=(""); owner="s:$a"; kind=service;;
+      health)  [ "$kind" = service ] || bad "health belongs under a service"; last=$((${#SVC_NAME[@]} - 1)); SVC_HEALTH[$last]=$rest;;
+      job)     ok_name "$rest" || bad "job takes a name"; JOB_NAME+=("$rest"); JOB_USES+=(""); owner="j:$rest"; kind=job;;
+      uses)    [ "$kind" = job ] || [ "$kind" = step ] || bad "uses belongs under a job"; for a in $rest; do ok_name "$a" || bad "uses takes service names"; done
+               last=$((${#JOB_NAME[@]} - 1)); JOB_USES[$last]="$rest";;
+      step)    [ ${#JOB_NAME[@]} -gt 0 ] || bad "a step belongs under a job"; case "$rest" in *:*) ;; *) bad "step takes  name: command";; esac
+               a="$(trim "${rest%%:*}")"; rest="$(trim "${rest#*:}")"; ok_name "$a" || bad "a step name takes letters, digits, dot, dash and underscore"; [ -n "$rest" ] || bad "step $a has no command"
+               STEP_NAME+=("$a"); STEP_JOB+=($((${#JOB_NAME[@]} - 1))); STEP_CMD+=("$rest"); STEP_COUNT+=(""); STEP_EXPECT+=(""); STEP_PR+=(0); kind=step;;
+      tests)   [ "$kind" = step ] || bad "tests belongs under a step"; last=$((${#STEP_NAME[@]} - 1))
+               case "$rest" in node) a='^[^ ]+ tests [0-9]+$';; tap) a='^# tests [0-9]+';; jest) a='^Tests:.* [0-9]+ total';; vitest) a='^ *Tests .*\([0-9]+\)';; pytest) a='[0-9]+ passed';; go) a='@go';;
+                 *) bad "tests: node, tap, jest, vitest, pytest or go (or use count with your own pattern)";; esac; STEP_COUNT[$last]=$a;;
+      count)   [ "$kind" = step ] || bad "count belongs under a step"; [ -n "$rest" ] || bad "count takes a pattern"; last=$((${#STEP_NAME[@]} - 1)); STEP_COUNT[$last]=$rest;;
+      expect)  [ "$kind" = step ] || bad "expect belongs under a step"; [ -n "$rest" ] || bad "expect takes a pattern"; last=$((${#STEP_NAME[@]} - 1)); STEP_EXPECT[$last]=$rest;;
+      pr-only) [ "$kind" = step ] || bad "pr-only belongs under a step"; last=$((${#STEP_NAME[@]} - 1)); STEP_PR[$last]=1;;
+      scan)    a="${rest%%[[:space:]]*}"; rest="$(trim "${rest#"$a"}")"; case "$a" in actionlint|osv|gitleaks|semgrep) ;; *) bad "scan: actionlint, osv, gitleaks or semgrep";; esac
+               for last in $rest; do case "$last" in -*) [ "$a" = actionlint ] || bad "scan $a takes no options";; esac; ok_ref "${last#-}" || bad "scan $a: cannot use $last"; done
+               SCAN_KIND+=("$a"); SCAN_ARGS+=("$rest"); kind=scan;;
+      *) bad "unknown word: $word";;
+    esac
+  done < "$file"
+}
+if [ -n "$CONFIG" ]; then [ -f "$CONFIG" ] || die "no such config: $CONFIG"; CONFIG_LABEL="$CONFIG"; CONFIG_FROM="$CONFIG, NOT the commit's own (--config)"; load_config "$CONFIG"
+else
+  CONFIG_LABEL=".local-ci/config"; CONFIG_FROM="the commit's own .local-ci/config"; CFG_TMP="$(mktemp /tmp/local-ci-config.XXXXXX)"
+  git -C "$SRC" show "$SHA:.local-ci/config" > "$CFG_TMP" 2>/dev/null || { rm -f "$CFG_TMP"; die "commit ${SHA:0:10} has no .local-ci/config. Run: local-ci init   (then commit it), or try one out with --config <file>."; }
+  load_config "$CFG_TMP"; rm -f "$CFG_TMP"
+fi
+[ ${#STEP_NAME[@]} -eq 0 ] || [ -n "$IMAGE" ] || die "$CONFIG_LABEL: steps need an image (image <ref>)"
+
+[ -z "$BASE" ] && { if [ "$HAS_ORIGIN" = 1 ]; then BASE="origin/$DEFAULT_BASE"; else BASE="$DEFAULT_BASE"; fi; }
+TREE="$(git -C "$SRC" rev-parse "$SHA^{tree}")"
+BASE_SHA="$(git -C "$SRC" rev-parse --verify "$BASE^{commit}" 2>/dev/null)" || die "cannot find the base $BASE (try: git fetch origin, or --base <ref>)"
+BASE_TREE="$(git -C "$SRC" rev-parse "$BASE_SHA^{tree}")"; BASE_NAME="${BASE#origin/}"
+MERGE_BASE="$(git -C "$SRC" merge-base "$BASE_SHA" "$SHA" 2>/dev/null)"; [ -z "$MERGE_BASE" ] && MERGE_BASE="$BASE_SHA"
+AHEAD="$(git -C "$SRC" rev-list --count "$BASE_SHA..$SHA")"
+if git -C "$SRC" merge-base --is-ancestor "$BASE_SHA" "$SHA"; then UPTODATE=yes; else UPTODATE=NO; fi
+if [ -z "$BRANCH" ]; then
+  if [ "$REF" = HEAD ]; then BRANCH="$(git -C "$SRC" branch --show-current)"
+  elif git -C "$SRC" show-ref --verify -q "refs/remotes/origin/${REF#origin/}"; then BRANCH="${REF#origin/}"
+  elif git -C "$SRC" show-ref --verify -q "refs/heads/$REF"; then BRANCH="$REF"; fi
+fi
+if [ -n "$TITLE" ]; then MODE="pull-request"; else MODE="push"; fi
+[ "$MODE" = pull-request ] && [ -z "$AUTHOR" ] && AUTHOR="$RUNNER"
+if [ "$REF" = HEAD ] && [ -n "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]; then echo "note: uncommitted changes are NOT tested; only commit ${SHA:0:10} is."; fi
+HOSTARCH="$(docker info --format '{{.Architecture}}' 2>/dev/null)"; NATIVE_X64=0
+case "$PLATFORM" in linux/amd64) NATIVE_X64=1;; "") case "$HOSTARCH" in x86_64|amd64) NATIVE_X64=1;; esac;; esac
+
+# ---------------------------------------------------------------- what runs
+# The checks of this run, in order. Pull-request steps and the merge exist only for a pull request; x64 only where the machine is not x64 already.
+CHECKS=()
+[ "$MODE" = pull-request ] && CHECKS+=(merge)
+[ ${#MIRROR_FILE[@]} -gt 0 ] && CHECKS+=(mirrors)
+[ -n "$INSTALL" ] && [ ${#STEP_NAME[@]} -gt 0 ] && CHECKS+=(install)
+i=0; while [ $i -lt ${#STEP_NAME[@]} ]; do { [ "${STEP_PR[$i]}" = 1 ] && [ "$MODE" != pull-request ]; } || CHECKS+=("${STEP_NAME[$i]}"); i=$((i + 1)); done
+[ -n "$X64_CMD" ] && CHECKS+=(x64)
+i=0; while [ $i -lt ${#SCAN_KIND[@]} ]; do CHECKS+=("${SCAN_KIND[$i]}"); i=$((i + 1)); done
+[ ${#CHECKS[@]} -gt 0 ] || die "$CONFIG_LABEL declares no checks"
+ALLNAMES=",$(IFS=,; echo "${CHECKS[*]}"),"
+for c in "${CHECKS[@]}"; do k=0; for d in "${CHECKS[@]}"; do [ "$c" = "$d" ] && k=$((k + 1)); done; [ $k -eq 1 ] || die "$CONFIG_LABEL: two checks are called $c (merge, mirrors, install, x64 and the scanners' names are taken)"; done
+for n in ${ONLY//,/ } ${SKIP//,/ }; do in_list "$n" "${ALLNAMES#,}" || { echo "unknown check: $n"; echo "checks: ${CHECKS[*]}"; exit 2; }; done
+want() { if [ -n "$ONLY" ]; then in_list "$1" "$ONLY"; else ! in_list "$1" "$SKIP"; fi; }
+RUN=" "; for c in "${CHECKS[@]}"; do want "$c" && RUN="$RUN$c "; done
+sel() { case "$RUN" in *" $1 "*) return 0;; esac; return 1; }
+NEEDS_WORK=0; i=0; while [ $i -lt ${#STEP_NAME[@]} ]; do sel "${STEP_NAME[$i]}" && NEEDS_WORK=1; i=$((i + 1)); done
+[ "$NEEDS_WORK" = 1 ] && [ -n "$INSTALL" ] && { sel install || RUN="${RUN}install "; }
+sel install && NEEDS_WORK=1
+[ "$MODE" = pull-request ] && { sel merge || RUN="${RUN}merge "; }   # a pull request is always tested as its merge with the base
+
+OUT="/tmp/local-ci/$NAME/${SHA:0:10}"; LOGS="$OUT/logs"; RES="$OUT/res"; mkdir -p "/tmp/local-ci/$NAME"
+mkdir "$OUT.lock" 2>/dev/null || die "a run for ${SHA:0:10} is already going on this machine (if it died, remove $OUT.lock)"
+rm -rf "$OUT"; mkdir -p "$LOGS" "$RES"; rm -f "$EVID/$SHA.md"
+PRISTINE="$(mktemp -d /tmp/local-ci-src.XXXXXX)"; ID="lci-$$"; VOL="$ID-work"; VOL64="$ID-work64"
+PLAT=(); [ -n "$PLATFORM" ] && PLAT=(--platform "$PLATFORM")
+cleanup() {
+  local c; c="$(docker ps -aq --filter "name=^$ID-svc-" 2>/dev/null)"; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1
+  docker volume rm -f "$VOL" "$VOL64" >/dev/null 2>&1; rm -rf "$PRISTINE" 2>/dev/null; rmdir "$OUT.lock" 2>/dev/null
+}
+trap cleanup EXIT; trap 'echo; echo "interrupted"; exit 130' INT TERM HUP
+STARTED=$SECONDS
+record() { echo "$2 $3 $4" > "$RES/$1"; }   # name, status, seconds, detail
+
+# Copies of exactly what is tested, as CI has a checkout per job:
+#   PRISTINE  a clone on this disk that nothing writes to; the scanners read it (mounted read-only), so they never see installed packages or a build.
+#   VOL       a Docker volume holding a copy of it, where the install and the steps run. VOL64 is the same for the x64 check.
+git clone -q --no-checkout "$SRC" "$PRISTINE" || die "could not copy the repository"
+git -C "$PRISTINE" fetch -q "$SRC" "+refs/remotes/origin/*:refs/remotes/origin/*" "+refs/tags/*:refs/tags/*" "+refs/local-ci/*:refs/local-ci/*" 2>/dev/null
+git -C "$PRISTINE" checkout -q --detach "$SHA" || die "could not check out $SHA"
+
+echo "local-ci $VERSION: $NAME ${SHA:0:10} (tree ${TREE:0:10}), $MODE${PR:+ #$PR}${BRANCH:+, branch $BRANCH}, base $BASE_NAME ${BASE_SHA:0:10} ($AHEAD ahead, contains it: $UPTODATE)"
+# A pull request is tested as CI tests it: its head merged into the base branch as it is now. A branch that already contains the base is that merge.
+TESTED="the commit itself"; MERGE_OK=1
+if [ "$MODE" = pull-request ]; then
+  printf '  %-18s ' "merge"
+  if [ "$UPTODATE" = yes ]; then record merge PASS 0 "the commit already contains $BASE_NAME ${BASE_SHA:0:10}"; echo "pass  the commit already contains $BASE_NAME ${BASE_SHA:0:10}"
+  elif git -C "$PRISTINE" -c user.name=local-ci -c user.email=local-ci@localhost merge -q --no-edit "$BASE_SHA" >"$LOGS/merge.log" 2>&1; then
+    TESTED="the merge of the commit with $BASE_NAME ${BASE_SHA:0:10}, as CI tests a pull request"; record merge PASS 0 "tested merged with $BASE_NAME ${BASE_SHA:0:10}"; echo "pass  tested merged with $BASE_NAME ${BASE_SHA:0:10}"
+  else git -C "$PRISTINE" merge --abort >/dev/null 2>&1; MERGE_OK=0; record merge FAIL 0 "conflicts with $BASE_NAME ${BASE_SHA:0:10}"; echo "FAIL  conflicts with $BASE_NAME ${BASE_SHA:0:10}; nothing else can be tested"; fi
+fi
+
+pull() { docker pull -q --platform "${2:-${PLATFORM:-linux/$HOSTARCH}}" "$1" >/dev/null 2>&1 || echo "note: could not refresh $1; using the copy already here."; }
+GITENV=(-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
+AS_USER=(); OWNER=""   # OWNER: the uid:gid the steps run as, for handing the working copy to that user
+[ -n "$RUN_USER" ] && AS_USER=(--user "$RUN_USER"); [ -n "$RUN_HOME" ] && AS_USER+=(-e "HOME=$RUN_HOME")
+HELPER="$T_gitleaks"   # a small pinned image that has git and a shell, for resetting the working copy between jobs whatever the project's image holds
+CACHE_MOUNTS=(); CACHE_FILL=(); i=0; while [ $i -lt ${#CACHES[@]} ]; do CACHE_MOUNTS+=(-v "local-ci-cache-$NAME-$i:${CACHES[$i]}"); CACHE_FILL+=(-v "local-ci-cache-$NAME-$i:/lci-cache/$i"); i=$((i + 1)); done
+KEEP_ARGS=""; for k in "${KEEPS[@]}"; do KEEP_ARGS="$KEEP_ARGS -e $k"; done
+# A working copy in a volume, owned by the user the steps run as (CI's steps run as an ordinary user too; root ignores file permissions).
+fill() {
+  docker volume create "$1" >/dev/null
+  if [ -n "$RUN_USER" ] && [ -z "$OWNER" ]; then OWNER="$(docker run --rm "${PLAT[@]}" --user "$RUN_USER" "$IMAGE" sh -c 'echo "$(id -u):$(id -g)"' 2>/dev/null)"; [ -n "$OWNER" ] || { echo "the image has no user called $RUN_USER"; return 1; }; fi
+  docker run --rm "${PLAT[@]}" --user 0 -v "$PRISTINE:/lci-src:ro" -v "$1:/repo" "${CACHE_FILL[@]}" -e "LCI_OWNER=$OWNER" "$IMAGE" sh -c 'cp -a /lci-src/. /repo/ && if [ -n "$LCI_OWNER" ]; then chown -R "$LCI_OWNER" /repo; for d in /lci-cache/*; do [ -d "$d" ] && chown -R "$LCI_OWNER" "$d"; done; fi; true'
+}
+envs_of() {   # owner -> ENVARGS: -e NAME=value for every env line of that owner
+  ENVARGS=(); local j=0; while [ $j -lt ${#ENV_KV[@]} ]; do [ "${ENV_OWNER[$j]}" = "$1" ] && ENVARGS+=(-e "${ENV_KV[$j]}"); j=$((j + 1)); done
+}
+# Fresh service containers for one job, as CI gives each job its own. They share one network, so every service answers on 127.0.0.1 as it does on a GitHub runner.
+NET=()
+start_services() {   # the job's `uses` list; 0 when all are up
+  local s j first="" cname; NET=()
+  for s in $1; do
+    j=0; while [ $j -lt ${#SVC_NAME[@]} ] && [ "${SVC_NAME[$j]}" != "$s" ]; do j=$((j + 1)); done
+    [ $j -lt ${#SVC_NAME[@]} ] || { echo "no service called $s"; return 1; }
+    cname="$ID-svc-$s"; envs_of "s:$s"; pull "${SVC_IMAGE[$j]}"
+    local net=(); [ -n "$first" ] && net=(--network "container:$first"); local hc=(); [ -n "${SVC_HEALTH[$j]}" ] && hc=(--health-cmd "${SVC_HEALTH[$j]}" --health-interval 2s --health-timeout 3s --health-retries 30)
+    docker run -d --name "$cname" "${PLAT[@]}" "${net[@]}" "${ENVARGS[@]}" "${hc[@]}" "${SVC_IMAGE[$j]}" >/dev/null || return 1
+    [ -z "$first" ] && first="$cname"
+    local t=0; while [ $t -lt 60 ]; do
+      if [ -n "${SVC_HEALTH[$j]}" ]; then [ "$(docker inspect -f '{{.State.Health.Status}}' "$cname" 2>/dev/null)" = healthy ] && break
+      else [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = true ] && { sleep 2; break; }; fi
+      sleep 2; t=$((t + 1)); done
+    [ $t -lt 60 ] || { echo "service $s did not come up"; return 1; }
+  done
+  [ -n "$first" ] && NET=(--network "container:$first"); return 0
+}
+stop_services() { local c; c="$(docker ps -aq --filter "name=^$ID-svc-" 2>/dev/null)"; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1; NET=(); }
+
+# What a passing log must show, so a check cannot pass by doing nothing. Prints the detail for the table; fails on an empty pass.
+last_numbers() { awk '{n=""; s=$0; while (match(s, /[0-9]+/)) { n=substr(s, RSTART, RLENGTH); s=substr(s, RSTART + RLENGTH) } if (n != "") t += n} END {print t + 0}'; }
+evidence() {   # check name, step index (or empty)
+  local log="$LOGS/$1.log" n m f rx detail=""
+  case "$1" in
+    osv) n="$(grep -aoE 'found [0-9]+ packages' "$log" | last_numbers)"; [ "${n:-0}" -gt 0 ] || { echo "no packages read"; return 1; }; echo "$n packages"; return 0;;
+    gitleaks) n="$(grep -aoE '[0-9]+ commits scanned' "$log" | tail -1 | awk '{print $1}')"; [ "${n:-0}" -gt 0 ] || { echo "no commits scanned"; return 1; }; echo "$n commits, $LEAKSCOPE"; return 0;;
+    semgrep) n="$(grep -aoE 'Ran [0-9]+ rules on [0-9]+ files' "$log" | tail -1)"; m="$(echo "$n" | awk '{print $2}')"; f="$(echo "$n" | awk '{print $5}')"
+      [ "${m:-0}" -gt 0 ] && [ "${f:-0}" -gt 0 ] || { echo "no rules ran"; return 1; }
+      grep -aq 'limited to files tracked by git' "$log" || { echo "did not keep to the files git tracks"; return 1; }; echo "$m rules, $f files"; return 0;;
+    x64) [ "$(sed -n 1p "$log")" = x86_64 ] || { echo "ran as $(sed -n 1p "$log"), not x64"; return 1; }; echo "on x64"; return 0;;
+  esac
+  [ -n "$2" ] || return 0
+  rx="${STEP_COUNT[$2]}"
+  if [ -n "$rx" ]; then
+    if [ "$rx" = "@go" ]; then n="$(grep -acE '^ok[[:space:]]' "$log")"; else n="$(grep -aoE -- "$rx" "$log" | last_numbers)"; fi
+    [ "${n:-0}" -gt 0 ] || { echo "no tests ran"; return 1; }; detail="$n tests"
+  fi
+  rx="${STEP_EXPECT[$2]}"
+  if [ -n "$rx" ]; then m="$(grep -aoE -- "$rx" "$log" | tail -1 | cut -c1-70)"; [ -n "$m" ] || { echo "the log does not show what the config expects"; return 1; }; detail="${detail:+$detail, }$m"; fi
+  echo "$detail"; return 0
+}
+finish() {   # name, exit code, seconds, step index
+  local name=$1 rc=$2 secs=$3 detail=""
+  if [ "$rc" -eq 0 ]; then detail="$(evidence "$name" "$4")" || rc=1; else detail="exit $rc"; fi
+  if [ "$rc" -eq 0 ]; then record "$name" PASS "$secs" "$detail"; echo "pass  (${secs}s)${detail:+  $detail}"; return 0; fi
+  record "$name" FAIL "$secs" "$detail"; echo "FAIL  (${secs}s)  $detail; see $LOGS/$name.log"; return 1
+}
+# A command in the project's image, on a working copy, as the configured user. Bash with pipefail where the image has bash, plain sh otherwise.
+PRENV=(); [ "$MODE" = pull-request ] && PRENV=(-e "PR_TITLE=$TITLE" -e "PR_BRANCH=$BRANCH" -e "PR_AUTHOR=$AUTHOR" -e "PR_NUMBER=$PR")
+in_image() {   # volume, platform args..., --, command
+  local vol=$1; shift; local plat=(); while [ "$1" != "--" ]; do plat+=("$1"); shift; done; shift
+  docker run --rm "${plat[@]}" "${AS_USER[@]}" "${GITENV[@]}" -e CI=true -e LANG=C.UTF-8 -e "BASE_BRANCH=$BASE_NAME" -e "LOCAL_CI_SHA=$SHA" -e "LOCAL_CI_BASE=$BASE_SHA" -e "LOCAL_CI_MERGE_BASE=$MERGE_BASE" \
+    "${PRENV[@]}" "${GENV[@]}" "${JENV[@]}" "${NET[@]}" -v "$vol:/repo" "${CACHE_MOUNTS[@]}" -v "$TOOL/recipes:/local-ci:ro" -w /repo "$IMAGE" \
+    sh -c 'if command -v bash >/dev/null 2>&1; then exec bash -eo pipefail -c "$0"; else exec sh -ec "$0"; fi' "$1"
+}
+INSTALL_OK=1; INSTALLED=0; FIRST_JOB=1
+run_install() {   # the first time it is the `install` check; after a job boundary that wiped the packages it runs again, quietly
+  [ -n "$INSTALL" ] || return 0
+  if [ "$INSTALLED" = 0 ]; then
+    INSTALLED=1; printf '  %-18s ' "install"; local t0=$SECONDS
+    in_image "$VOL" "${PLAT[@]}" -- "$INSTALL" >"$LOGS/install.log" 2>&1; finish install $? $((SECONDS - t0)) "" || INSTALL_OK=0
+  elif [ "$INSTALL_OK" = 1 ] && [ ${#KEEPS[@]} -eq 0 ]; then
+    in_image "$VOL" "${PLAT[@]}" -- "$INSTALL" >>"$LOGS/install.log" 2>&1 || { INSTALL_OK=0; record install FAIL 0 "failed when repeated for a later job"; echo "  install            FAIL  failed when repeated for a later job; see $LOGS/install.log"; }
+  fi
+}
+# Where one CI job ends and the next begins, the working copy goes back to a fresh checkout. Paths named by `keep` stay (installed packages), otherwise the install runs again.
+new_job() {
+  [ "$FIRST_JOB" = 1 ] && { FIRST_JOB=0; return 0; }
+  docker run --rm "${PLAT[@]}" --user 0 --entrypoint sh "${GITENV[@]}" -e "LCI_OWNER=$OWNER" -v "$VOL:/repo" -w /repo "$HELPER" -c "git clean -fdxq $KEEP_ARGS && git reset -q --hard && if [ -n \"\$LCI_OWNER\" ]; then find /repo ! -user \"\${LCI_OWNER%%:*}\" -exec chown \"\$LCI_OWNER\" {} +; fi" >>"$LOGS/new-job.log" 2>&1
+}
+
+# ---------------------------------------------------------------- the run
+if [ "$MERGE_OK" = 1 ]; then
+  if sel mirrors; then
+    printf '  %-18s ' "mirrors"; BAD=""; i=0
+    while [ $i -lt ${#MIRROR_FILE[@]} ]; do got="$(sha256 "$PRISTINE/${MIRROR_FILE[$i]}" 2>/dev/null)"; [ "$got" = "${MIRROR_SHA[$i]}" ] || BAD="$BAD ${MIRROR_FILE[$i]}"; i=$((i + 1)); done
+    if [ -z "$BAD" ]; then record mirrors PASS 0 "${#MIRROR_FILE[@]} file(s) unchanged"; echo "pass  ${#MIRROR_FILE[@]} file(s) unchanged"
+    else echo "Changed since .local-ci/config was written to mirror them:$BAD. Bring the config's steps into line with them, then update the sha256 on their mirrors lines." >"$LOGS/mirrors.log"
+      record mirrors FAIL 0 "changed:$BAD"; echo "FAIL  changed:$BAD; the config may no longer mirror them"; fi
+  fi
+  if [ "$NEEDS_WORK" = 1 ]; then pull "$IMAGE"; pull "$HELPER"; fill "$VOL" || die "could not fill the working copy"; fi
+  envs_of g; GENV=("${ENVARGS[@]}"); JENV=()
+  j=0
+  while [ $j -lt ${#JOB_NAME[@]} ]; do
+    ANY=0; i=0; while [ $i -lt ${#STEP_NAME[@]} ]; do [ "${STEP_JOB[$i]}" = "$j" ] && sel "${STEP_NAME[$i]}" && ANY=1; i=$((i + 1)); done
+    if [ "$ANY" = 1 ]; then
+      new_job; JENV=(); NET=(); run_install
+      SVC_OK=1; if [ -n "${JOB_USES[$j]}" ] && [ "$INSTALL_OK" = 1 ]; then start_services "${JOB_USES[$j]}" >"$LOGS/services-${JOB_NAME[$j]}.log" 2>&1 || SVC_OK=0; fi
+      envs_of "j:${JOB_NAME[$j]}"; JENV=("${ENVARGS[@]}")
+      i=0
+      while [ $i -lt ${#STEP_NAME[@]} ]; do
+        s="${STEP_NAME[$i]}"
+        if [ "${STEP_JOB[$i]}" = "$j" ] && sel "$s"; then
+          if [ "$INSTALL_OK" != 1 ]; then record "$s" SKIP 0 "the install did not succeed"
+          elif [ "$SVC_OK" != 1 ]; then record "$s" FAIL 0 "a service of job ${JOB_NAME[$j]} did not start"; echo "  $s: FAIL  a service did not start; see $LOGS/services-${JOB_NAME[$j]}.log"
+          elif [ "${STEP_PR[$i]}" = 1 ] && [ -z "$BRANCH" ]; then record "$s" SKIP 0 "give --branch, the pull request's head branch"
+          else printf '  %-18s ' "$s"; t0=$SECONDS; in_image "$VOL" "${PLAT[@]}" -- "${STEP_CMD[$i]}" >"$LOGS/$s.log" 2>&1; finish "$s" $? $((SECONDS - t0)) "$i"; fi
+        fi
+        i=$((i + 1))
+      done
+      stop_services; JENV=()
+    fi
+    j=$((j + 1))
+  done
+  # The project's own command on x64, which is what hosted CI and most servers run, when this machine is not x64 (an Apple Silicon Mac).
+  if sel x64; then
+    if [ "$NATIVE_X64" = 1 ]; then record x64 PASS 0 "the whole run is x64"; echo "  x64                pass  the whole run is x64"
+    else pull "$IMAGE" linux/amd64; NET=(); JENV=()
+      if fill "$VOL64"; then printf '  %-18s ' "x64"; t0=$SECONDS; in_image "$VOL64" --platform linux/amd64 -- "uname -m; $X64_CMD" >"$LOGS/x64.log" 2>&1; finish x64 $? $((SECONDS - t0)) ""
+      else record x64 FAIL 0 "could not make its working copy"; fi
+      docker volume rm -f "$VOL64" >/dev/null 2>&1; fi
+  fi
+  # Scanners, each from its own pinned image, on the untouched copy.
+  i=0
+  while [ $i -lt ${#SCAN_KIND[@]} ]; do
+    k="${SCAN_KIND[$i]}"; a="${SCAN_ARGS[$i]}"
+    if sel "$k"; then
+      printf '  %-18s ' "$k"; t0=$SECONDS
+      case "$k" in
+        actionlint) # shellcheck disable=SC2086
+          docker run --rm "${PLAT[@]}" -v "$PRISTINE:/repo:ro" -w /repo "$T_actionlint" -color=false $a >"$LOGS/$k.log" 2>&1;;
+        osv) OSVARGS=(); for f in $a; do OSVARGS+=("--lockfile=$f"); done; [ ${#OSVARGS[@]} -gt 0 ] || OSVARGS=(--recursive .)
+          docker run --rm "${PLAT[@]}" -v "$PRISTINE:/repo:ro" -w /repo "$T_osv" scan "${OSVARGS[@]}" >"$LOGS/$k.log" 2>&1;;
+        gitleaks) # a pull request is scanned for its own commits, a push in full; so is a pull request with no commit of its own, which would otherwise scan nothing
+          if [ "$MODE" = pull-request ] && [ "$FULL" != 1 ] && [ "$AHEAD" -gt 0 ]; then LEAKARGS=(git --redact --verbose --exit-code 1 "--log-opts=${BASE_SHA}..${SHA}" .); LEAKSCOPE="the pull request's own"
+          else LEAKARGS=(git --redact --verbose --exit-code 1 .); LEAKSCOPE="whole history"; fi
+          docker run --rm "${PLAT[@]}" "${GITENV[@]}" -v "$PRISTINE:/repo:ro" -w /repo "$T_gitleaks" "${LEAKARGS[@]}" >"$LOGS/$k.log" 2>&1;;
+        semgrep) SEMARGS=(); for f in $a; do SEMARGS+=(--config "$f"); done; [ ${#SEMARGS[@]} -gt 0 ] || SEMARGS=(--config auto)
+          docker run --rm "${PLAT[@]}" "${GITENV[@]}" -v "$PRISTINE:/src:ro" -w /src "$T_semgrep" semgrep scan "${SEMARGS[@]}" --metrics off --error >"$LOGS/$k.log" 2>&1;;
+      esac
+      finish "$k" $? $((SECONDS - t0)) ""
+    fi
+    i=$((i + 1))
+  done
+fi
+
+# ---------------------------------------------------------------- the summary
+NFAIL=0; NPASS=0; NALL=${#CHECKS[@]}; FAILED=""; SUM="$OUT/summary.md"
+{
+  echo "Local CI for commit \`${SHA}\`"
+  echo
+  echo "- project: ${NAME} (local-ci ${VERSION})"
+  echo "- tree: \`${TREE}\`"
+  echo "- tested: ${TESTED}"
+  echo "- mode: ${MODE}${PR:+ #$PR}"
+  [ "$MODE" = pull-request ] && { echo "- title: ${TITLE}"; echo "- branch: ${BRANCH}"; echo "- author: ${AUTHOR}"; }
+  echo "- base: ${BASE_NAME} \`${BASE_SHA}\`, ${FETCHED}; the commit is ${AHEAD} ahead and contains it: ${UPTODATE}"
+  echo "- config: ${CONFIG_FROM}"
+  echo "- run: $(date -u '+%Y-%m-%d %H:%M UTC') by ${RUNNER:-an unknown account}, ${HOSTARCH} host${PLATFORM:+, containers as $PLATFORM}, a clean copy in ${IMAGE:-no image}${RUN_USER:+ as the user $RUN_USER}"
+  echo; echo "| check | result | seconds | detail |"; echo "|---|---|---|---|"
+} > "$SUM"
+echo; echo "Results"
+for c in "${CHECKS[@]}"; do
+  [ -f "$RES/$c" ] || continue; read -r st secs note < "$RES/$c"
+  [ "$st" = FAIL ] && { NFAIL=$((NFAIL + 1)); FAILED="$FAILED $c"; }; [ "$st" = PASS ] && NPASS=$((NPASS + 1))
+  printf '  %-18s %s%s\n' "$c" "$st" "${note:+  ($note)}"; echo "| $c | $st | $secs | $note |" >> "$SUM"
+done
+for c in "${CHECKS[@]}"; do
+  [ -f "$RES/$c" ] && read -r st _ < "$RES/$c" && [ "$st" = FAIL ] && [ -f "$LOGS/$c.log" ] && { echo; echo "--- last lines of $c ---"; tail -n 15 "$LOGS/$c.log"; }
+done
+# Test counts, kept by tree (a squash merge keeps the tree, so the base branch's counts are the ones its pull request recorded). A suite that now runs fewer tests than the
+# base did is said out loud: a deleted or skipped test passes every check.
+COUNTS="$EVID/trees/$TREE"; BASECOUNTS="$EVID/trees/$BASE_TREE"; DROPS=""; COMPARED=0; i=0
+while [ $i -lt ${#STEP_NAME[@]} ]; do
+  s="${STEP_NAME[$i]}"; i=$((i + 1)); [ -n "${STEP_COUNT[$((i - 1))]}" ] && [ -f "$RES/$s" ] || continue
+  read -r st _ note < "$RES/$s"; [ "$st" = PASS ] || continue; now="${note%% *}"
+  { grep -v "^$s " "$COUNTS" 2>/dev/null; echo "$s $now"; } > "$COUNTS.tmp" && mv "$COUNTS.tmp" "$COUNTS"
+  [ "$TREE" != "$BASE_TREE" ] && [ -f "$BASECOUNTS" ] || continue
+  was="$(sed -n "s/^$s //p" "$BASECOUNTS" | head -1)"; [ -n "$was" ] || continue; COMPARED=1
+  [ "$now" -lt "$was" ] && DROPS="$DROPS $s $now (the base ran $was);"
+done
+if [ -n "$DROPS" ]; then TESTLINE="FEWER TESTS than the base ${BASE_SHA:0:10}:${DROPS%;}. Say why in the pull request."; echo; echo "note: $TESTLINE"
+elif [ "$COMPARED" = 1 ]; then TESTLINE="no suite runs fewer tests than the base ${BASE_SHA:0:10} did."
+else TESTLINE="no recorded run of the base ${BASE_SHA:0:10} to compare test counts with."; fi
+
+MINS=$(( (SECONDS - STARTED + 30) / 60 ))
+echo
+if [ $NFAIL -gt 0 ]; then VERDICT="$NFAIL check(s) failed:$FAILED."; echo "$NFAIL CHECK(S) FAILED:$FAILED"; RC=1
+elif [ $NPASS -eq 0 ]; then VERDICT="No check ran."; echo "NO CHECK RAN"; RC=2
+elif [ -n "$CONFIG" ]; then VERDICT="Passed with a config that is not the commit's own ($NPASS of $NALL checks). This is not merge evidence."; echo "PASSED with a trial config ($NPASS of $NALL checks) for ${SHA:0:10}; not merge evidence"; RC=0
+elif [ $NPASS -eq $NALL ]; then VERDICT="Full run: every check passed."; echo "ALL CHECKS PASSED for ${SHA:0:10}  (full run, $NALL checks, $MINS min)"; RC=0
+else VERDICT="Partial run: the $NPASS of $NALL checks that ran passed. This is not merge evidence."; echo "PASSED, PARTIAL: $NPASS of $NALL checks ran for ${SHA:0:10}; not merge evidence"; RC=0; fi
+{ echo; echo "Test counts: $TESTLINE"; echo; echo "$VERDICT"; } >> "$SUM"
+cp "$SUM" "$EVID/$SHA.md"
+echo "Summary: $SUM"
+
+# --post: tell GitHub. A commit status costs no Actions minutes and shows on the pull request. Only a full pass or a failure is posted; a partial pass proves nothing,
+# and neither does a run with a config that is not the commit's own.
+if [ "$POST" = 1 ]; then
+  KEY="$(status_key "$BASE_SHA" "$TITLE" "$PR")"   # `local-ci/1 full` is what the merge hook accepts; the key lets it see that the base, the title and the pull request are still the ones tested
+  STATE=""; [ $NFAIL -gt 0 ] && { STATE=failure; DESC="local-ci/1 fail $KEY ${HOSTARCH} $NFAIL failed:$FAILED"; }
+  [ $NFAIL -eq 0 ] && [ $NPASS -eq $NALL ] && { STATE=success; DESC="local-ci/1 full $NALL/$NALL $KEY ${HOSTARCH} ${MINS}m"; }
+  if [ -n "$CONFIG" ]; then echo "not posted: the config was not the commit's own."
+  elif [ -z "$STATE" ]; then echo "not posted: a partial run is not evidence."
+  elif (cd "$SRC" && gh api "repos/{owner}/{repo}/statuses/$SHA" -f "state=$STATE" -f context=local-ci -f "description=${DESC:0:140}" >/dev/null 2>"$LOGS/post.log"); then
+    echo "posted to GitHub: local-ci = $STATE on ${SHA:0:10}"
+    [ -n "$PR" ] && { (cd "$SRC" && gh pr comment "$PR" --body-file "$SUM" >/dev/null 2>>"$LOGS/post.log") && echo "posted the summary on pull request #$PR" || echo "note: could not comment on #$PR; see $LOGS/post.log"; }
+  else echo "note: could not post the status (is ${SHA:0:10} pushed?); see $LOGS/post.log"; fi
+fi
+exit $RC

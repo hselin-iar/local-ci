@@ -1,0 +1,34 @@
+# .local-ci/config: what `local-ci` runs for this repository. It is read as data (one instruction per line), never executed on your machine;
+# the commands after `install`, `step` and `x64` run only inside containers. Commit it: a run always uses the config of the commit it tests.
+#
+#   base <branch>              the branch pull requests merge into (default main)
+#   image <ref>                the image the steps run in        user / home   the unprivileged user they run as, and its home directory
+#   cache <path>               a directory in the container kept between runs (a package cache)
+#   keep <path>                a path in the repository kept between jobs (installed packages); without it the install runs again for every job
+#   install <command>          run before the first step
+#   env NAME=value             for every step; under a `job`, for that job's steps; under a `service`, for that service
+#   service <name> <image>     a container the steps can reach on 127.0.0.1; `health <command>` says when it is ready. Each job that `uses` it gets a fresh one.
+#   job <name>                 a group of steps on its own fresh checkout, like a CI job;  `uses <service> ...` gives it services
+#   step <name>: <command>     a check. Under it:  tests node|tap|jest|vitest|pytest|go   (must run at least one test; the count is recorded and compared with the base branch)
+#                                                  count <pattern>   the same for another runner: every match adds the last number in it
+#                                                  expect <pattern>  the log must contain this, or the step fails
+#                                                  pr-only           runs only for a pull request (it gets PR_TITLE, PR_BRANCH, PR_AUTHOR, PR_NUMBER, BASE_BRANCH)
+#   x64 <command>              run once more as x64 (hosted CI's and most servers' CPU) when this machine is arm64
+#   scan gitleaks | scan osv <lockfile> ... | scan semgrep <ruleset> ... | scan actionlint [options]
+#   mirrors <file> <sha256>    fail when that file changes, so this config cannot drift from the workflow it copies
+#   tool <scanner> <image>     pin another version of a scanner
+
+base main
+image node:24-bookworm
+
+base main
+# image <the image your checks run in>
+# install <the command that installs dependencies>
+
+# job test
+#   step unit: <the command that runs your tests>
+#     expect <something a real test run always prints>
+
+scan gitleaks
+scan semgrep p/secrets
+scan actionlint
