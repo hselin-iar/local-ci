@@ -7,7 +7,7 @@ local-ci --pr 101        # a pull request as hosted CI sees it
 local-ci                 # the commit you are on, as a push is checked
 ```
 
-Needs Docker and git; `gh` for `--pr`, `--post` and `--watch`; `jq` for the merge hook. Works on macOS, Linux and Windows under WSL 2 (not Git Bash).
+Needs Docker and git; `gh` for `--pr`, `--post` and `--watch`; `jq` for the merge hook. Works on macOS, Linux and Windows under WSL 2 (not Git Bash). On a Mac it keeps the machine from idle-sleeping while it runs (a closed lid still sleeps).
 
 ## Install
 

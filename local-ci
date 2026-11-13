@@ -92,6 +92,9 @@ case "$PR" in *[!0-9]*) die "--pr needs a number";; esac
 
 SRC="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || die "Docker is not running. Start it and try again."
+# A Mac left alone goes to sleep and takes Docker with it: a run of minutes then takes hours. Keep it awake for as long as this script lives (a --watch included).
+# It does not stop the sleep of a closed lid; on Linux there is nothing to do.
+command -v caffeinate >/dev/null 2>&1 && { caffeinate -i -w $$ </dev/null >/dev/null 2>&1 & }
 GITDIR="$(git -C "$SRC" rev-parse --path-format=absolute --git-common-dir)"; EVID="$GITDIR/local-ci"; mkdir -p "$EVID/trees"
 RUNNER="$(cd "$SRC" && gh api user -q .login 2>/dev/null)"   # whose machine this is: written in the summary, and GitHub records it on a posted status
 
