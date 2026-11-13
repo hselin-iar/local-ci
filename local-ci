@@ -108,7 +108,7 @@ if [ -n "$WATCH" ]; then
     { read -r title; read -r head; read -r base; } <<<"$meta"
     tip="$(cd "$SRC" && gh api "repos/{owner}/{repo}/git/ref/heads/$base" -q .object.sha 2>/dev/null)" || return 0
     st="$(cd "$SRC" && gh api "repos/{owner}/{repo}/commits/$head/statuses" -q '[.[] | select(.context=="local-ci")][0].description // ""' 2>/dev/null)" || return 0
-    case "$st" in *"$(status_key "$tip" "$title" "$1")"*) return 0;; esac; return 1
+    case " $st " in *" $(status_key "$tip" "$title" "$1") "*) return 0;; esac; return 1   # each part matched whole: pr=10 is not pr=101
   }
   echo "Watching open pull requests as ${RUNNER:-?}, every ${WATCH}s. Each new head commit gets a full run and a local-ci status. Ctrl-C stops."
   while :; do
@@ -188,11 +188,11 @@ load_config() {
     esac
   done < "$file"
 }
-if [ -n "$CONFIG" ]; then [ -f "$CONFIG" ] || die "no such config: $CONFIG"; CONFIG_LABEL="$CONFIG"; CONFIG_FROM="$CONFIG, NOT the commit's own (--config)"; load_config "$CONFIG"
+if [ -n "$CONFIG" ]; then [ -f "$CONFIG" ] || die "no such config: $CONFIG"; CONFIG_LABEL="$CONFIG"; CONFIG_FROM="$CONFIG, NOT the commit's own (--config)"; CFGSUM="$(sha256 "$CONFIG")"; load_config "$CONFIG"
 else
   CONFIG_LABEL=".local-ci/config"; CONFIG_FROM="the commit's own .local-ci/config"; CFG_TMP="$(mktemp /tmp/local-ci-config.XXXXXX)"
   git -C "$SRC" show "$SHA:.local-ci/config" > "$CFG_TMP" 2>/dev/null || { rm -f "$CFG_TMP"; die "commit ${SHA:0:10} has no .local-ci/config. Run: local-ci init   (then commit it), or try one out with --config <file>."; }
-  load_config "$CFG_TMP"; rm -f "$CFG_TMP"
+  CFGSUM="$(sha256 "$CFG_TMP")"; load_config "$CFG_TMP"; rm -f "$CFG_TMP"   # the hash goes in the summary: the merge hook accepts a run only when its config is the base branch's own
 fi
 [ ${#STEP_NAME[@]} -eq 0 ] || [ -n "$IMAGE" ] || die "$CONFIG_LABEL: steps need an image (image <ref>)"
 
@@ -237,7 +237,7 @@ sel install && NEEDS_WORK=1
 
 OUT="/tmp/local-ci/$NAME/${SHA:0:10}"; LOGS="$OUT/logs"; RES="$OUT/res"; mkdir -p "/tmp/local-ci/$NAME"
 mkdir "$OUT.lock" 2>/dev/null || die "a run for ${SHA:0:10} is already going on this machine (if it died, remove $OUT.lock)"
-rm -rf "$OUT"; mkdir -p "$LOGS" "$RES"; rm -f "$EVID/$SHA.md"
+rm -rf "$OUT"; mkdir -p "$LOGS" "$RES"
 PRISTINE="$(mktemp -d /tmp/local-ci-src.XXXXXX)"; ID="lci-$$"; VOL="$ID-work"; VOL64="$ID-work64"
 PLAT=(); [ -n "$PLATFORM" ] && PLAT=(--platform "$PLATFORM")
 cleanup() {
@@ -432,6 +432,7 @@ NFAIL=0; NPASS=0; NALL=${#CHECKS[@]}; FAILED=""; SUM="$OUT/summary.md"
   [ "$MODE" = pull-request ] && { echo "- title: ${TITLE}"; echo "- branch: ${BRANCH}"; echo "- author: ${AUTHOR}"; }
   echo "- base: ${BASE_NAME} \`${BASE_SHA}\`, ${FETCHED}; the commit is ${AHEAD} ahead and contains it: ${UPTODATE}"
   echo "- config: ${CONFIG_FROM}"
+  echo "- config-sha256: ${CFGSUM}"
   echo "- run: $(date -u '+%Y-%m-%d %H:%M UTC') by ${RUNNER:-an unknown account}, ${HOSTARCH} host${PLATFORM:+, containers as $PLATFORM}, a clean copy in ${IMAGE:-no image}${RUN_USER:+ as the user $RUN_USER}"
   echo; echo "| check | result | seconds | detail |"; echo "|---|---|---|---|"
 } > "$SUM"
@@ -467,13 +468,16 @@ elif [ -n "$CONFIG" ]; then VERDICT="Passed with a config that is not the commit
 elif [ $NPASS -eq $NALL ]; then VERDICT="Full run: every check passed."; echo "ALL CHECKS PASSED for ${SHA:0:10}  (full run, $NALL checks, $MINS min)"; RC=0
 else VERDICT="Partial run: the $NPASS of $NALL checks that ran passed. This is not merge evidence."; echo "PASSED, PARTIAL: $NPASS of $NALL checks ran for ${SHA:0:10}; not merge evidence"; RC=0; fi
 { echo; echo "Test counts: $TESTLINE"; echo; echo "$VERDICT"; } >> "$SUM"
-cp "$SUM" "$EVID/$SHA.md"
+# The record the merge hook reads. A failure or a full pass always replaces it. A partial or trial pass does not replace a full pass of the same commit:
+# checking one thing again must not cost the full run that is already there.
+if [ $NFAIL -eq 0 ] && { [ $NPASS -ne $NALL ] || [ -n "$CONFIG" ]; } && grep -q '^Full run: every check passed\.$' "$EVID/$SHA.md" 2>/dev/null; then echo "The full run already recorded for ${SHA:0:10} is kept."
+else cp "$SUM" "$EVID/$SHA.md"; fi
 echo "Summary: $SUM"
 
 # --post: tell GitHub. A commit status costs no Actions minutes and shows on the pull request. Only a full pass or a failure is posted; a partial pass proves nothing,
 # and neither does a run with a config that is not the commit's own.
 if [ "$POST" = 1 ]; then
-  KEY="$(status_key "$BASE_SHA" "$TITLE" "$PR")"   # `local-ci/1 full` is what the merge hook accepts; the key lets it see that the base, the title and the pull request are still the ones tested
+  KEY="$(status_key "$BASE_SHA" "$TITLE" "$PR") cfg=${CFGSUM:0:8}"   # `local-ci/1 full` is what the merge hook accepts; the key lets it see that the base, the title and the pull request are still the ones tested
   STATE=""; [ $NFAIL -gt 0 ] && { STATE=failure; DESC="local-ci/1 fail $KEY ${HOSTARCH} $NFAIL failed:$FAILED"; }
   [ $NFAIL -eq 0 ] && [ $NPASS -eq $NALL ] && { STATE=success; DESC="local-ci/1 full $NALL/$NALL $KEY ${HOSTARCH} ${MINS}m"; }
   if [ -n "$CONFIG" ]; then echo "not posted: the config was not the commit's own."

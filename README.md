@@ -78,7 +78,7 @@ Every step also gets `LOCAL_CI_SHA`, `LOCAL_CI_BASE`, `LOCAL_CI_MERGE_BASE`, and
 
 A table at the end; one log per check under `/tmp/local-ci/<project>/<commit>/`; and `summary.md` there, also kept in `.git/local-ci/<commit>.md`, which survives a restart. Paste the summary into the pull request.
 
-`ALL CHECKS PASSED (full run)` is the only result that counts as evidence. `--only`, `--skip` and `--config` runs say they are not.
+`ALL CHECKS PASSED (full run)` is the only result that counts as evidence. `--only`, `--skip` and `--config` runs say they are not, and when they pass they do not replace a full pass already recorded for the same commit (a failure always does).
 
 ## Working as a team
 
@@ -91,15 +91,19 @@ A table at the end; one log per check under `/tmp/local-ci/<project>/<commit>/`;
 `local-ci hook --install` adds a hook to the repository's `.claude/settings.local.json`. From then on a Claude Code session there cannot run `gh pr merge` unless the pull request's head commit has either:
 
 - every required GitHub check green, or
-- a full local-ci run recorded on that machine: no check failed or skipped, the commit's own config, made for the pull request as it stands (the same title, branch and author, against the base branch's present tip), or
+- a full local-ci run recorded on that machine: no check failed or skipped, made for the pull request as it stands (the same title, branch and author, against the base branch's present tip), with the base branch's own `.local-ci/config`, or
 - the same run posted from another machine by a trusted account: the account `gh` is logged in as, plus `git config local-ci.trusted "login1 login2"`. The list lives in that clone's git config, not in a tracked file, so a pull request cannot add its own author.
 
 With `--admin` on the command and no such proof, the hook asks you to approve by hand instead of refusing.
 
+It is strict about the command, so that what it checked is what gets merged: `gh pr merge <number> --squash --match-head-commit <sha>`, the number first, one merge per command (the hook names the sha when it is missing). A merge through `gh api` is refused, and so is anything that looks like a merge when the hook cannot read the command or `jq` is missing.
+
+A pull request that edits `.local-ci/config` is judged by its own edits, so its run is not accepted as proof: the summary records the config's hash, and the hook compares it with the base branch's. For such a pull request (the first one that adds the config included) the way through is `--admin` and your approval, after you have read the change.
+
 ## Limits, plainly
 
 - **It is evidence, not a gate.** GitHub's branch protection knows only GitHub's own checks, unless you make `local-ci` a required status. Anyone who can push can post that status, which is why the hook looks at who posted it. Nothing here stops a merge made on GitHub's page.
-- **The config travels with the code**, as a workflow file does: a pull request can change its own checks. Review changes to `.local-ci/config` as you would changes to a workflow.
+- **The config travels with the code**, as a workflow file does: a pull request can change its own checks. The merge hook does not accept such a run as proof (see above), but a run by hand still passes, so review changes to `.local-ci/config` as you would changes to a workflow.
 - **Containers are not a strong sandbox.** A step is code from the repository running in Docker on your machine. Run only code you would run anyway.
 - **The CPU.** On an Apple Silicon Mac the steps run as arm64; only the `x64` command is repeated as x64. `--platform linux/amd64` runs everything as x64 and is several times slower.
 - **The image is yours, not a GitHub runner's.** Anything a workflow gets from the runner image or from an action (`setup-node`, a cache, a secret) has to be said in the config as an image, an install command or an env line. Secrets are not supported: checks that need real credentials do not belong here.
@@ -107,4 +111,4 @@ With `--admin` on the command and no such proof, the hook asks you to approve by
 
 ## Checking the tool itself
 
-`tests/selftest.sh` builds a toy project and proves that a clean commit passes and that each kind of defect fails: a failing test, a test step that runs nothing, a committed token, a pull request behind its base, a conflict, a config that tries to pass options to Docker. Run it after changing `local-ci`.
+`tests/hook.sh` runs the merge hook through 40 cases against a stand-in `gh`: what counts as a merge, which pull request is checked, what evidence is accepted, whose shared result counts. `tests/selftest.sh` builds a toy project and proves that a clean commit passes and that each kind of defect fails: a failing test, a test step that runs nothing, a committed token, a pull request behind its base, a conflict, a config that tries to pass options to Docker. Run both after changing `local-ci` or the hook.
